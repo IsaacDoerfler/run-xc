@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from "react";
-
+import React, { useState, useEffect, useCallback } from "react";
+import { supabase } from "./supabaseClient";
+import Auth from "./Auth";
 // ---------- Design tokens ----------
 const C = {
   bg: "#EEF0EA",
@@ -12,7 +13,6 @@ const C = {
   sky: "#3A6B7A",
 };
 
-const uid = () => Math.random().toString(36).slice(2, 10);
 const todayStr = () => new Date().toISOString().slice(0, 10);
 const fmtDate = (d) =>
   new Date(d + "T00:00:00").toLocaleDateString(undefined, {
@@ -29,22 +29,56 @@ function paceFromDistDuration(distance, durationMin) {
   return `${m}:${s.toString().padStart(2, "0")}/mi`;
 }
 
-// ---------- localStorage-backed state ----------
-function usePersisted(key, initial) {
-  const [value, setValue] = useState(() => {
-    try {
-      const raw = localStorage.getItem(key);
-      return raw ? JSON.parse(raw) : initial;
-    } catch {
-      return initial;
+// ---------- Supabase-backed table hook ----------
+// Fetches all rows for a table on mount, and exposes insertRow / deleteRow
+// that write straight to Supabase and update local state to match.
+function useSupabaseTable(table) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const { data, error } = await supabase
+      .from(table)
+      .select("*")
+      .order("date", { ascending: false });
+    if (error) {
+      console.error(`Failed to load ${table}:`, error.message);
+    } else {
+      setRows(data);
     }
-  });
+    setLoading(false);
+  }, [table]);
 
   useEffect(() => {
-    localStorage.setItem(key, JSON.stringify(value));
-  }, [key, value]);
+    load();
+  }, [load]);
 
-  return [value, setValue];
+  const insertRow = useCallback(
+    async (row) => {
+      const { data, error } = await supabase.from(table).insert(row).select();
+      if (error) {
+        console.error(`Failed to insert into ${table}:`, error.message);
+        return;
+      }
+      setRows((prev) => [data[0], ...prev]);
+    },
+    [table]
+  );
+
+  const deleteRow = useCallback(
+    async (id) => {
+      const { error } = await supabase.from(table).delete().eq("id", id);
+      if (error) {
+        console.error(`Failed to delete from ${table}:`, error.message);
+        return;
+      }
+      setRows((prev) => prev.filter((r) => r.id !== id));
+    },
+    [table]
+  );
+
+  return { rows, loading, insertRow, deleteRow };
 }
 
 // ---------- UI atoms ----------
@@ -141,12 +175,34 @@ const TABS = [
 ];
 
 export default function App() {
+  const [session, setSession] = useState(null);
+const [sessionLoading, setSessionLoading] = useState(true);
+
+useEffect(() => {
+  supabase.auth.getSession().then(({ data: { session } }) => {
+    setSession(session);
+    setSessionLoading(false);
+  });
+  const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    setSession(session);
+  });
+  return () => subscription.unsubscribe();
+}, []);
   const [tab, setTab] = useState("today");
-  const [runs, setRuns] = usePersisted("runs", []);
-  const [recovery, setRecovery] = usePersisted("recovery", []);
-  const [hydration, setHydration] = usePersisted("hydration", []);
-  const [nutrition, setNutrition] = usePersisted("nutrition", []);
-  const [strength, setStrength] = usePersisted("strength", []);
+
+  const runsTable = useSupabaseTable("runs");
+  const recoveryTable = useSupabaseTable("recovery");
+  const hydrationTable = useSupabaseTable("hydration");
+  const nutritionTable = useSupabaseTable("nutrition");
+  const strengthTable = useSupabaseTable("strength");
+
+  const anyLoading =
+    runsTable.loading || recoveryTable.loading || hydrationTable.loading ||
+    nutritionTable.loading || strengthTable.loading;
+
+  const runs = runsTable.rows;
+  const recovery = recoveryTable.rows;
+  const hydration = hydrationTable.rows;
 
   const weekAgo = new Date();
   weekAgo.setDate(weekAgo.getDate() - 6);
@@ -170,16 +226,42 @@ export default function App() {
     return streak;
   })();
 
+    if (sessionLoading) {
+    return (
+      <div style={{ background: C.bg, minHeight: "100vh" }} />
+    );
+  }
+
+  if (!session) {
+    return <Auth />;
+  }
+
+  if (anyLoading) {
+    return (
+      <div style={{ background: C.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: C.textMuted, fontFamily: "'IBM Plex Sans', sans-serif" }}>
+        Loading run.xc…
+      </div>
+    );
+  }
+
   return (
     <div style={{ background: C.bg, minHeight: "100vh", fontFamily: "'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif", color: C.text, padding: "0 0 40px 0" }}>
-      <div style={{ padding: "26px 24px 18px", borderBottom: `1px solid ${C.line}` }}>
-        <div style={{ fontFamily: "'Barlow Condensed', 'IBM Plex Sans', sans-serif", fontSize: 30, fontWeight: 700, letterSpacing: 0.5, textTransform: "uppercase", color: C.moss }}>
-          run.xc
-        </div>
-        <div style={{ fontSize: 13.5, color: C.textMuted, marginTop: 2 }}>
-          {new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}
-        </div>
-      </div>
+      <div style={{ padding: "26px 24px 18px", borderBottom: `1px solid ${C.line}`, display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+  <div>
+    <div style={{ fontFamily: "'Barlow Condensed', 'IBM Plex Sans', sans-serif", fontSize: 30, fontWeight: 700, letterSpacing: 0.5, textTransform: "uppercase", color: C.moss }}>
+      run.xc
+    </div>
+    <div style={{ fontSize: 13.5, color: C.textMuted, marginTop: 2 }}>
+      {new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}
+    </div>
+  </div>
+  <button
+    onClick={() => supabase.auth.signOut()}
+    style={{ background: "none", border: `1px solid ${C.line}`, borderRadius: 7, padding: "7px 14px", fontSize: 13, color: C.textMuted, cursor: "pointer", fontFamily: "inherit" }}
+  >
+    Sign out
+  </button>
+</div>
 
       <div style={{ display: "flex", gap: 4, padding: "14px 20px 0", flexWrap: "wrap" }}>
         {TABS.map((t) => (
@@ -215,11 +297,11 @@ export default function App() {
             recentRuns={[...runs].sort((a, b) => (a.date < b.date ? 1 : -1)).slice(0, 3)}
           />
         )}
-        {tab === "runs" && <RunsTab runs={runs} setRuns={setRuns} />}
-        {tab === "recovery" && <RecoveryTab recovery={recovery} setRecovery={setRecovery} />}
-        {tab === "hydration" && <HydrationTab hydration={hydration} setHydration={setHydration} />}
-        {tab === "nutrition" && <NutritionTab nutrition={nutrition} setNutrition={setNutrition} />}
-        {tab === "strength" && <StrengthTab strength={strength} setStrength={setStrength} />}
+        {tab === "runs" && <RunsTab table={runsTable} />}
+        {tab === "recovery" && <RecoveryTab table={recoveryTable} />}
+        {tab === "hydration" && <HydrationTab table={hydrationTable} />}
+        {tab === "nutrition" && <NutritionTab table={nutritionTable} />}
+        {tab === "strength" && <StrengthTab table={strengthTable} />}
       </div>
     </div>
   );
@@ -255,15 +337,23 @@ function TodayTab({ weekMiles, weekRunsCount, todayOz, latestRecovery, streakDay
   );
 }
 
-function RunsTab({ runs, setRuns }) {
+function RunsTab({ table }) {
+  const { rows, insertRow, deleteRow } = table;
   const [form, setForm] = useState({ date: todayStr(), distance: "", duration: "", effort: "5", notes: "" });
+
   const addRun = () => {
     if (!form.distance || !form.duration) return;
-    setRuns([...runs, { id: uid(), ...form }]);
+    insertRow({
+      date: form.date,
+      distance: Number(form.distance),
+      duration: Number(form.duration),
+      effort: Number(form.effort),
+      notes: form.notes,
+    });
     setForm({ date: todayStr(), distance: "", duration: "", effort: "5", notes: "" });
   };
-  const removeRun = (id) => setRuns(runs.filter((r) => r.id !== id));
-  const sorted = [...runs].sort((a, b) => (a.date < b.date ? 1 : -1));
+
+  const sorted = [...rows].sort((a, b) => (a.date < b.date ? 1 : -1));
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -291,7 +381,7 @@ function RunsTab({ runs, setRuns }) {
                 <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14 }}>
                   <span style={{ fontWeight: 600 }}>{fmtDate(r.date)}</span>
                   <span>{r.distance} mi · {r.duration} min · {paceFromDistDuration(Number(r.distance), Number(r.duration))}</span>
-                  <button onClick={() => removeRun(r.id)} style={{ border: "none", background: "none", color: C.clay, cursor: "pointer", fontSize: 13 }}>remove</button>
+                  <button onClick={() => deleteRow(r.id)} style={{ border: "none", background: "none", color: C.clay, cursor: "pointer", fontSize: 13 }}>remove</button>
                 </div>
                 {r.notes && <div style={{ fontSize: 12.5, color: C.textMuted, marginTop: 3 }}>{r.notes}</div>}
               </div>
@@ -303,18 +393,27 @@ function RunsTab({ runs, setRuns }) {
   );
 }
 
-function RecoveryTab({ recovery, setRecovery }) {
+function RecoveryTab({ table }) {
+  const { rows, insertRow } = table;
   const [form, setForm] = useState({ date: todayStr(), sleepHours: "", soreness: "3", restingHR: "" });
+
   const addEntry = () => {
     if (!form.sleepHours) return;
     const sleepScore = Math.min(Number(form.sleepHours) / 8, 1) * 50;
     const sorenessScore = (10 - Number(form.soreness)) * 3;
     const hrPenalty = form.restingHR ? Math.max(0, (Number(form.restingHR) - 50) * 0.5) : 0;
     const score = Math.max(0, Math.min(100, Math.round(sleepScore + sorenessScore + 20 - hrPenalty)));
-    setRecovery([...recovery, { id: uid(), ...form, score }]);
+    insertRow({
+      date: form.date,
+      sleep_hours: Number(form.sleepHours),
+      soreness: Number(form.soreness),
+      resting_hr: form.restingHR ? Number(form.restingHR) : null,
+      score,
+    });
     setForm({ date: todayStr(), sleepHours: "", soreness: "3", restingHR: "" });
   };
-  const sorted = [...recovery].sort((a, b) => (a.date < b.date ? 1 : -1));
+
+  const sorted = [...rows].sort((a, b) => (a.date < b.date ? 1 : -1));
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -337,7 +436,7 @@ function RecoveryTab({ recovery, setRecovery }) {
             {sorted.map((r) => (
               <div key={r.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, borderBottom: `1px solid ${C.line}`, paddingBottom: 8 }}>
                 <span style={{ fontWeight: 600 }}>{fmtDate(r.date)}</span>
-                <span>{r.sleepHours}h sleep · soreness {r.soreness}/10</span>
+                <span>{r.sleep_hours}h sleep · soreness {r.soreness}/10</span>
                 <span style={{ fontWeight: 700, color: C.clay }}>{r.score}</span>
               </div>
             ))}
@@ -348,10 +447,11 @@ function RecoveryTab({ recovery, setRecovery }) {
   );
 }
 
-function HydrationTab({ hydration, setHydration }) {
+function HydrationTab({ table }) {
+  const { rows, insertRow } = table;
   const [oz, setOz] = useState("8");
-  const addOz = (amount) => setHydration([...hydration, { id: uid(), date: todayStr(), oz: amount }]);
-  const todayEntries = hydration.filter((h) => h.date === todayStr());
+  const addOz = (amount) => insertRow({ date: todayStr(), oz: amount });
+  const todayEntries = rows.filter((h) => h.date === todayStr());
   const todayTotal = todayEntries.reduce((s, h) => s + Number(h.oz || 0), 0);
 
   return (
@@ -378,14 +478,22 @@ function HydrationTab({ hydration, setHydration }) {
   );
 }
 
-function NutritionTab({ nutrition, setNutrition }) {
+function NutritionTab({ table }) {
+  const { rows, insertRow } = table;
   const [form, setForm] = useState({ date: todayStr(), meal: "Breakfast", notes: "", calories: "" });
+
   const addMeal = () => {
     if (!form.notes) return;
-    setNutrition([...nutrition, { id: uid(), ...form }]);
+    insertRow({
+      date: form.date,
+      meal: form.meal,
+      notes: form.notes,
+      calories: form.calories ? Number(form.calories) : null,
+    });
     setForm({ date: todayStr(), meal: "Breakfast", notes: "", calories: "" });
   };
-  const todayMeals = nutrition.filter((n) => n.date === todayStr());
+
+  const todayMeals = rows.filter((n) => n.date === todayStr());
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -425,15 +533,24 @@ function NutritionTab({ nutrition, setNutrition }) {
   );
 }
 
-function StrengthTab({ strength, setStrength }) {
+function StrengthTab({ table }) {
+  const { rows, insertRow } = table;
   const [form, setForm] = useState({ date: todayStr(), exercise: "", sets: "", reps: "", weight: "" });
+
   const addSet = () => {
     if (!form.exercise) return;
-    setStrength([...strength, { id: uid(), ...form }]);
+    insertRow({
+      date: form.date,
+      exercise: form.exercise,
+      sets: form.sets ? Number(form.sets) : null,
+      reps: form.reps ? Number(form.reps) : null,
+      weight: form.weight ? Number(form.weight) : null,
+    });
     setForm({ date: todayStr(), exercise: "", sets: "", reps: "", weight: "" });
   };
-  const todayEntries = strength.filter((s) => s.date === todayStr());
-  const sorted = [...strength].sort((a, b) => (a.date < b.date ? 1 : -1)).slice(0, 10);
+
+  const todayEntries = rows.filter((s) => s.date === todayStr());
+  const sorted = [...rows].sort((a, b) => (a.date < b.date ? 1 : -1)).slice(0, 10);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
