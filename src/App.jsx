@@ -1,6 +1,11 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { supabase } from "./supabaseClient";
 import Auth from "./Auth";
+import { tcxToRun } from "./tcx-reader";
+import ProfileSetup from "./ProfileSetup";
+import { smoothedElevationGainMeters } from "./elevation-utils";
+import { useTeam } from "./useTeam";
+import TeamTab from "./TeamTab";
 // ---------- Design tokens ----------
 const C = {
   bg: "#EEF0EA",
@@ -172,6 +177,7 @@ const TABS = [
   { id: "hydration", label: "Hydration" },
   { id: "nutrition", label: "Nutrition" },
   { id: "strength", label: "Strength" },
+  { id: "team", label: "Team" },
 ];
 
 export default function App() {
@@ -188,6 +194,25 @@ useEffect(() => {
   });
   return () => subscription.unsubscribe();
 }, []);
+const [profile, setProfile] = useState(null);
+const [profileChecked, setProfileChecked] = useState(false);
+const teamHook = useTeam(session?.user?.id);
+
+useEffect(() => {
+  if (!session) {
+    setProfileChecked(false);
+    return;
+  }
+  supabase
+    .from("profiles")
+    .select("*")
+    .eq("id", session.user.id)
+    .maybeSingle()
+    .then(({ data }) => {
+      setProfile(data);
+      setProfileChecked(true);
+    });
+}, [session]);
   const [tab, setTab] = useState("today");
 
   const runsTable = useSupabaseTable("runs");
@@ -232,9 +257,17 @@ useEffect(() => {
     );
   }
 
-  if (!session) {
-    return <Auth />;
-  }
+ if (!session) {
+  return <Auth />;
+}
+
+if (!profileChecked) {
+  return <div style={{ background: C.bg, minHeight: "100vh" }} />;
+}
+
+if (!profile) {
+  return <ProfileSetup userId={session.user.id} onDone={(name) => setProfile({ id: session.user.id, display_name: name })} />;
+}
 
   if (anyLoading) {
     return (
@@ -302,6 +335,7 @@ useEffect(() => {
         {tab === "hydration" && <HydrationTab table={hydrationTable} />}
         {tab === "nutrition" && <NutritionTab table={nutritionTable} />}
         {tab === "strength" && <StrengthTab table={strengthTable} />}
+        {tab === "team" && <TeamTab userId={session.user.id} teamHook={teamHook} />}
       </div>
     </div>
   );
@@ -337,9 +371,73 @@ function TodayTab({ weekMiles, weekRunsCount, todayOz, latestRecovery, streakDay
   );
 }
 
+function haversineMiles(lat1, lon1, lat2, lon2) {
+  const R = 3958.8; // earth radius in miles
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.asin(Math.sqrt(a));
+}
+
+function parseGpx(xmlText) {
+  const doc = new DOMParser().parseFromString(xmlText, "text/xml");
+  const trkpts = Array.from(doc.getElementsByTagName("trkpt"));
+  if (trkpts.length < 2) return null;
+
+  let distance = 0;
+  let hrSum = 0;
+  let hrCount = 0;
+  let prevLat = null,
+    prevLon = null;
+
+  trkpts.forEach((pt) => {
+    const lat = parseFloat(pt.getAttribute("lat"));
+    const lon = parseFloat(pt.getAttribute("lon"));
+
+    const hrEl = pt.getElementsByTagName("hr")[0] || pt.getElementsByTagName("gpxtpx:hr")[0];
+    if (hrEl) {
+      hrSum += parseFloat(hrEl.textContent);
+      hrCount++;
+    }
+
+    if (prevLat !== null) {
+      distance += haversineMiles(prevLat, prevLon, lat, lon);
+    }
+    prevLat = lat;
+    prevLon = lon;
+  });
+
+  // Elevation gain: smoothed to filter out GPS/barometer noise
+  const elevations = trkpts.map((pt) => {
+    const eleEl = pt.getElementsByTagName("ele")[0];
+    return eleEl ? parseFloat(eleEl.textContent) : null;
+  });
+  const elevationGainMeters = smoothedElevationGainMeters(elevations);
+
+  const firstTime = trkpts[0].getElementsByTagName("time")[0]?.textContent;
+  const lastTime = trkpts[trkpts.length - 1].getElementsByTagName("time")[0]?.textContent;
+  let durationMin = null;
+  if (firstTime && lastTime) {
+    durationMin = (new Date(lastTime) - new Date(firstTime)) / 1000 / 60;
+  }
+
+  return {
+    date: firstTime ? firstTime.slice(0, 10) : todayStr(),
+    distance: Math.round(distance * 100) / 100,
+    duration: durationMin ? Math.round(durationMin) : null,
+    elevation_gain: Math.round(elevationGainMeters * 3.28084), // meters -> feet
+    avg_hr: hrCount ? Math.round(hrSum / hrCount) : null,
+  };
+}
+
 function RunsTab({ table }) {
   const { rows, insertRow, deleteRow } = table;
   const [form, setForm] = useState({ date: todayStr(), distance: "", duration: "", effort: "5", notes: "" });
+  const [importError, setImportError] = useState("");
+  const [importing, setImporting] = useState(false);
 
   const addRun = () => {
     if (!form.distance || !form.duration) return;
@@ -353,12 +451,54 @@ function RunsTab({ table }) {
     setForm({ date: todayStr(), distance: "", duration: "", effort: "5", notes: "" });
   };
 
+  const handleFile = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setImportError("");
+    setImporting(true);
+    try {
+      const text = await file.text();
+      const isTcx = file.name.toLowerCase().endsWith(".tcx");
+      const parsed = isTcx ? tcxToRun(text) : parseGpx(text);
+
+      if (!parsed || !parsed.distance || !parsed.duration) {
+        setImportError("Couldn't read distance/duration from that file.");
+      } else {
+        await insertRow({
+          date: parsed.date,
+          distance: parsed.distance,
+          duration: parsed.duration,
+          effort: 5,
+          notes: isTcx ? "Imported from TCX" : "Imported from GPX",
+          elevation_gain: parsed.elevation_gain,
+          avg_hr: parsed.avg_hr,
+        });
+      }
+    } catch (err) {
+      setImportError("Something went wrong reading that file.");
+      console.error(err);
+    } finally {
+      setImporting(false);
+      e.target.value = "";
+    }
+  };
+
   const sorted = [...rows].sort((a, b) => (a.date < b.date ? 1 : -1));
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
       <Card>
-        <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>Log a run</div>
+        <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>Import from Garmin</div>
+        <div style={{ fontSize: 13, color: C.textMuted, marginBottom: 12 }}>
+          Export a run as GPX or TCX from Garmin Connect (activity page → gear icon → Export), then upload it here.
+        </div>
+        <input type="file" accept=".gpx,.tcx" onChange={handleFile} disabled={importing} style={{ fontSize: 13.5 }} />
+        {importing && <div style={{ fontSize: 13, color: C.textMuted, marginTop: 8 }}>Reading file…</div>}
+        {importError && <div style={{ fontSize: 13, color: C.clay, marginTop: 8 }}>{importError}</div>}
+      </Card>
+
+      <Card>
+        <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>Log a run manually</div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 12 }}>
           <Field label="Date"><input style={inputStyle} type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} /></Field>
           <Field label="Distance (mi)"><input style={inputStyle} type="number" step="0.1" placeholder="3.1" value={form.distance} onChange={(e) => setForm({ ...form, distance: e.target.value })} /></Field>
@@ -370,6 +510,7 @@ function RunsTab({ table }) {
         </div>
         <div style={{ marginTop: 14 }}><Button onClick={addRun}>Save run</Button></div>
       </Card>
+
       <Card>
         <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 10 }}>History</div>
         {sorted.length === 0 ? (
@@ -378,11 +519,18 @@ function RunsTab({ table }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {sorted.map((r) => (
               <div key={r.id} style={{ borderBottom: `1px solid ${C.line}`, paddingBottom: 8 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14, flexWrap: "wrap", gap: 6 }}>
                   <span style={{ fontWeight: 600 }}>{fmtDate(r.date)}</span>
                   <span>{r.distance} mi · {r.duration} min · {paceFromDistDuration(Number(r.distance), Number(r.duration))}</span>
                   <button onClick={() => deleteRow(r.id)} style={{ border: "none", background: "none", color: C.clay, cursor: "pointer", fontSize: 13 }}>remove</button>
                 </div>
+                {(r.elevation_gain || r.avg_hr) && (
+                  <div style={{ fontSize: 12.5, color: C.textMuted, marginTop: 3 }}>
+                    {r.elevation_gain ? `${r.elevation_gain} ft gain` : ""}
+                    {r.elevation_gain && r.avg_hr ? " · " : ""}
+                    {r.avg_hr ? `${r.avg_hr} avg bpm` : ""}
+                  </div>
+                )}
                 {r.notes && <div style={{ fontSize: 12.5, color: C.textMuted, marginTop: 3 }}>{r.notes}</div>}
               </div>
             ))}
